@@ -445,7 +445,9 @@ impl UnionSchema {
 
         if let SchemaKind::Named = kind {
             for i in &self.named_index {
-                if value.validate_inner(&self.schemas[*i], &mut context.clone()) {
+                let mut temp_con = context.clone();
+                if value.validate_inner(&self.schemas[*i], &mut temp_con) {
+                    *context = temp_con;
                     return Some((*i, self.schemas[*i].clone()));
                 }
             }
@@ -571,6 +573,7 @@ impl Schema {
     /// `Schema`.
     fn parse_record(complex: &Map<String, Value>, context: &mut SchemaParseContext) -> Result<Arc<Self>, Error> {
         let name = Name::parse(complex, &context.current_namespace)?;
+        context.current_namespace = name.name.namespace.clone();
 
         let mut lookup = HashMap::new();
 
@@ -601,8 +604,9 @@ impl Schema {
 
     /// Parse a `serde_json::Value` representing a Avro enum type into a
     /// `Schema`.
-    fn parse_enum(complex: &Map<String, Value>, context: &SchemaParseContext) -> Result<Arc<Self>, Error> {
+    fn parse_enum(complex: &Map<String, Value>, context: &mut SchemaParseContext) -> Result<Arc<Self>, Error> {
         let name = Name::parse(complex, &context.current_namespace)?;
+        context.current_namespace = name.name.namespace.clone();
 
         let symbols = complex
             .get("symbols")
@@ -657,6 +661,7 @@ impl Schema {
     /// `Schema`.
     fn parse_fixed(complex: &Map<String, Value>, context: &mut SchemaParseContext) -> Result<Arc<Self>, Error> {
         let name = Name::parse(complex, &context.current_namespace)?;
+        context.current_namespace = name.name.namespace.clone();
 
         let size = complex
             .get("size")

@@ -185,7 +185,8 @@ impl<'a> Record<'a> {
     /// Create a `Record` given a `Schema`.
     ///
     /// If the `Schema` is not a `Schema::Record` variant, `None` will be returned.
-    pub fn new(schema: &Schema) -> Option<Record> {
+    pub fn new<'b>(schema: &'b Schema, placeholder: Option<&Value>) -> Option<Record<'b>> {
+        let placeholder = placeholder.unwrap_or(&Value::Null);
         match *schema {
             Schema::Record {
                 fields: ref schema_fields,
@@ -194,7 +195,7 @@ impl<'a> Record<'a> {
             } => {
                 let mut fields = Vec::with_capacity(schema_fields.len());
                 for schema_field in schema_fields.iter() {
-                    fields.push((schema_field.name.clone(), Value::Null));
+                    fields.push((schema_field.name.clone(), (*placeholder).clone()));
                 }
 
                 Some(Record {
@@ -270,32 +271,51 @@ impl Value {
             (&Value::Double(_), Schema::Double) => true,
             (&Value::Bytes(_), Schema::Bytes) => true,
             (&Value::String(_), Schema::String) => true,
-            (&Value::Fixed(n, _), Schema::Fixed { size, .. }) => n == *size,
+            (&Value::Fixed(n, _), Schema::Fixed { ref name, size }) => {
+                context.register_type(name, schema);
+                if let Some(_) = name.name.namespace {
+                    context.current_namespace = name.name.namespace.clone();
+                }
+                trace!("Val: Fixed({}) vs Fixed({:?}, {})", n, name, size);
+                n == *size
+            },
             (&Value::String(ref s), Schema::Enum { ref symbols, ref name, .. }) => {
                 context.register_type(name, schema);
-                context.current_namespace = name.name.namespace.clone();
+                if let Some(_) = name.name.namespace {
+                    context.current_namespace = name.name.namespace.clone();
+                }
+                trace!("Val: String({}) vs Enum({:?})", s, name);
                 symbols.contains(s)
             },
             (&Value::Enum(i, ref s), Schema::Enum { ref symbols, ref name, .. }) => {
-                context.current_namespace = name.name.namespace.clone();
+                if let Some(_) = name.name.namespace {
+                    context.current_namespace = name.name.namespace.clone();
+                }
                 context.register_type(name, schema);
+                trace!("Val: Enum({}) vs Enum({:?})", s, name);
                 symbols
                     .get(i as usize)
                     .map(|ref symbol| symbol == &s)
                     .unwrap_or(false)
             },
             (&Value::Union(ref value), Schema::Union(ref inner)) => {
+                trace!("Val: Union({:?}) vs Union({:?})", value, inner);
                 inner.find_schema(value, context).is_some()
             },
             (&Value::Array(ref items), Schema::Array(ref inner)) => {
+                trace!("Val: Array() vs Array()");
                 items.iter().all(|item| item.validate_inner(inner, context))
             },
             (&Value::Map(ref items), Schema::Map(ref inner)) => {
+                trace!("Val: Map() vs Map()");
                 items.iter().all(|(_, value)| value.validate_inner(inner, context))
             },
             (&Value::Record(ref record_fields), Schema::Record { ref fields, ref name, .. }) => {
-                context.current_namespace = name.name.namespace.clone();
+                if let Some(_) = name.name.namespace {
+                    context.current_namespace = name.name.namespace.clone();
+                }
                 context.register_type(name, schema);
+                trace!("Val: Record({:?}) vs Record({:?})", record_fields, name);
                 fields.len() == record_fields.len() && fields.iter().zip(record_fields.iter()).all(
                     |(field, &(ref name, ref value))| {
                         field.name == *name && value.validate_inner(&field.schema, context)
@@ -303,15 +323,27 @@ impl Value {
                 )
             },
             (r @ Value::Record(..), Schema::Union(ref inner)) => {
+                trace!("Val: Record() vs Union()");
                 inner.find_schema(r, context).is_some()
             },
             (&Value::Record(_), Schema::TypeReference (ref name)) => {
+                trace!("Val: Record() vs Ref({:?})", name);
                 match context.lookup_type(name, context) {
                     Some(ref s) => self.validate_inner(s, context),
                     None => false
                 }
             },
-            _ => false,
+            (&Value::Fixed(n, _), Schema::TypeReference (ref name)) => {
+                trace!("Val: Fixed({}) vs Ref({:?})", n, name);
+                match context.lookup_type(name, context) {
+                    Some(ref s) => self.validate_inner(s, context),
+                    None => false
+                }
+            },
+            (x, y) => {
+                trace!("Failed match ({:?}, {:?})", x, y);
+                false
+            },
         }
     }
 

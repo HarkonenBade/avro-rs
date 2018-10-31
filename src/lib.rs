@@ -499,6 +499,9 @@ extern crate rand;
 #[macro_use]
 extern crate serde;
 
+#[macro_use]
+extern crate log;
+
 extern crate serde_json;
 #[cfg(feature = "snappy")]
 extern crate snap;
