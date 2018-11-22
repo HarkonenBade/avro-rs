@@ -185,8 +185,11 @@ impl<'a> Record<'a> {
     /// Create a `Record` given a `Schema`.
     ///
     /// If the `Schema` is not a `Schema::Record` variant, `None` will be returned.
-    pub fn new<'b>(schema: &'b Schema, placeholder: Option<&Value>) -> Option<Record<'b>> {
-        let placeholder = placeholder.unwrap_or(&Value::Null);
+    pub fn new<'b>(schema: &'b Schema) -> Option<Record<'b>> {
+        Self::new_with_placeholder(schema, &Value::Null)
+    }
+
+    pub fn new_with_placeholder<'b>(schema: &'b Schema, placeholder: &Value) -> Option<Record<'b>> {
         match *schema {
             Schema::Record {
                 fields: ref schema_fields,
