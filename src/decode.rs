@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use failure::Error;
 
-use schema::{Schema, SchemaParseContext};
+use schema::{SchemaTree, SchemaParseContext};
 use types::Value;
 use util::{safe_len, zag_i32, zag_i64, DecodeError};
 
@@ -25,10 +25,10 @@ fn decode_len<R: Read>(reader: &mut R) -> Result<usize, Error> {
 }
 
 /// Decode a `Value` from avro format given its `Schema`.
-pub fn decode<R: Read>(schema: &Arc<Schema>, reader: &mut R, context: &mut SchemaParseContext) -> Result<Value, Error> {
+pub fn decode<R: Read>(schema: &Arc<SchemaTree>, reader: &mut R, context: &mut SchemaParseContext) -> Result<Value, Error> {
     match **schema {
-        Schema::Null => Ok(Value::Null),
-        Schema::Boolean => {
+        SchemaTree::Null => Ok(Value::Null),
+        SchemaTree::Boolean => {
             let mut buf = [0u8; 1];
             reader.read_exact(&mut buf[..])?;
 
@@ -38,19 +38,19 @@ pub fn decode<R: Read>(schema: &Arc<Schema>, reader: &mut R, context: &mut Schem
                 _ => Err(DecodeError::new("not a bool").into()),
             }
         },
-        Schema::Int => decode_int(reader),
-        Schema::Long => decode_long(reader),
-        Schema::Float => {
+        SchemaTree::Int => decode_int(reader),
+        SchemaTree::Long => decode_long(reader),
+        SchemaTree::Float => {
             let mut buf = [0u8; 4];
             reader.read_exact(&mut buf[..])?;
             Ok(Value::Float(unsafe { transmute::<[u8; 4], f32>(buf) }))
         },
-        Schema::Double => {
+        SchemaTree::Double => {
             let mut buf = [0u8; 8];
             reader.read_exact(&mut buf[..])?;
             Ok(Value::Double(unsafe { transmute::<[u8; 8], f64>(buf) }))
         },
-        Schema::Bytes => {
+        SchemaTree::Bytes => {
             let len = decode_len(reader)?;
             let mut buf = Vec::with_capacity(len);
             unsafe {
@@ -59,7 +59,7 @@ pub fn decode<R: Read>(schema: &Arc<Schema>, reader: &mut R, context: &mut Schem
             reader.read_exact(&mut buf)?;
             Ok(Value::Bytes(buf))
         },
-        Schema::String => {
+        SchemaTree::String => {
             let len = decode_len(reader)?;
             let mut buf = Vec::with_capacity(len);
             unsafe {
@@ -71,12 +71,12 @@ pub fn decode<R: Read>(schema: &Arc<Schema>, reader: &mut R, context: &mut Schem
                 .map(Value::String)
                 .map_err(|_| DecodeError::new("not a valid utf-8 string").into())
         },
-        Schema::Fixed { size, .. } => {
+        SchemaTree::Fixed { size, .. } => {
             let mut buf = vec![0u8; size as usize];
             reader.read_exact(&mut buf)?;
             Ok(Value::Fixed(size, buf))
         },
-        Schema::Array(ref inner) => {
+        SchemaTree::Array(ref inner) => {
             let mut items = Vec::new();
 
             loop {
@@ -95,7 +95,7 @@ pub fn decode<R: Read>(schema: &Arc<Schema>, reader: &mut R, context: &mut Schem
 
             Ok(Value::Array(items))
         },
-        Schema::Map(ref inner) => {
+        SchemaTree::Map(ref inner) => {
             let mut items = HashMap::new();
 
             loop {
@@ -108,7 +108,7 @@ pub fn decode<R: Read>(schema: &Arc<Schema>, reader: &mut R, context: &mut Schem
 
                 items.reserve(len as usize);
                 for _ in 0..len {
-                    if let Value::String(key) = decode(&Arc::new(Schema::String), reader, context)? {
+                    if let Value::String(key) = decode(&Arc::new(SchemaTree::String), reader, context)? {
                         let value = decode(&inner, reader, context)?;
                         items.insert(key, value);
                     } else {
@@ -119,7 +119,7 @@ pub fn decode<R: Read>(schema: &Arc<Schema>, reader: &mut R, context: &mut Schem
 
             Ok(Value::Map(items))
         },
-        Schema::Union(ref inner) => {
+        SchemaTree::Union(ref inner) => {
             let index = zag_i64(reader)?;
             let variants = inner.variants();
             match variants.get(index as usize) {
@@ -127,7 +127,7 @@ pub fn decode<R: Read>(schema: &Arc<Schema>, reader: &mut R, context: &mut Schem
                 None => Err(DecodeError::new("Union index out of bounds").into()),
             }
         },
-        Schema::Record { ref fields, ref name, .. } => {
+        SchemaTree::Record { ref fields, ref name, .. } => {
             context.register_type(name, schema);
             // Benchmarks indicate ~10% improvement using this method.
             let mut items = Vec::new();
@@ -142,7 +142,7 @@ pub fn decode<R: Read>(schema: &Arc<Schema>, reader: &mut R, context: &mut Schem
             // .collect::<Result<Vec<(String, Value)>, _>>()
             // .map(|items| Value::Record(items))
         },
-        Schema::Enum { ref symbols, .. } => {
+        SchemaTree::Enum { ref symbols, .. } => {
             if let Value::Int(index) = decode_int(reader)? {
                 if index >= 0 && (index as usize) <= symbols.len() {
                     let symbol = symbols[index as usize].clone();
@@ -154,7 +154,7 @@ pub fn decode<R: Read>(schema: &Arc<Schema>, reader: &mut R, context: &mut Schem
                 Err(DecodeError::new("enum symbol not found").into())
             }
         },
-        Schema::TypeReference(ref name) => context.lookup_type(name, &context)
+        SchemaTree::TypeReference(ref name) => context.lookup_type(name, &context)
             .map_or_else(|| Err(DecodeError::new("enum symbol not found").into()),
                          |s| decode(&s, reader, context)),
     }

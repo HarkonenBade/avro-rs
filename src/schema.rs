@@ -24,11 +24,17 @@ impl ParseSchemaError {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Schema {
+    tree: Arc<SchemaTree>,
+    type_reg: HashMap<String, Arc<SchemaTree>>,
+}
+
 /// Represents any valid Avro schema
 /// More information about Avro schemas can be found in the
 /// [Avro Specification](https://avro.apache.org/docs/current/spec.html#schemas)
 #[derive(Clone, Debug, PartialEq)]
-pub enum Schema {
+pub enum SchemaTree {
     /// A `null` Avro schema.
     Null,
     /// A `boolean` Avro schema.
@@ -51,11 +57,11 @@ pub enum Schema {
     TypeReference(NameRef),
     /// A `array` Avro schema.
     /// `Array` holds a counted reference (`Rc`) to the `Schema` of its items.
-    Array(Arc<Schema>),
+    Array(Arc<SchemaTree>),
     /// A `map` Avro schema.
     /// `Map` holds a pointer to the `Schema` of its values, which must all be the same schema.
     /// `Map` keys are assumed to be `string`.
-    Map(Arc<Schema>),
+    Map(Arc<SchemaTree>),
     /// A `union` Avro schema.
     Union(UnionSchema),
     /// A `record` Avro schema.
@@ -102,26 +108,26 @@ pub(crate) enum SchemaKind {
     Named,
 }
 
-impl<'a> From<&'a Schema> for SchemaKind {
+impl<'a> From<&'a SchemaTree> for SchemaKind {
     #[inline(always)]
-    fn from(schema: &'a Schema) -> SchemaKind {
+    fn from(schema: &'a SchemaTree) -> SchemaKind {
         // NOTE: I _believe_ this will always be fast as it should convert into a jump table.
         match schema {
-            Schema::Null => SchemaKind::Null,
-            Schema::Boolean => SchemaKind::Boolean,
-            Schema::Int => SchemaKind::Int,
-            Schema::Long => SchemaKind::Long,
-            Schema::Float => SchemaKind::Float,
-            Schema::Double => SchemaKind::Double,
-            Schema::Bytes => SchemaKind::Bytes,
-            Schema::String => SchemaKind::String,
-            Schema::Array(_) => SchemaKind::Array,
-            Schema::Map(_) => SchemaKind::Map,
-            Schema::Union(_) => SchemaKind::Union,
-            Schema::Record{ .. } => SchemaKind::Named,
-            Schema::TypeReference{ .. } => SchemaKind::Named,
-            Schema::Fixed{ .. } => SchemaKind::Named,
-            Schema::Enum{ .. } => SchemaKind::Named,
+            SchemaTree::Null => SchemaKind::Null,
+            SchemaTree::Boolean => SchemaKind::Boolean,
+            SchemaTree::Int => SchemaKind::Int,
+            SchemaTree::Long => SchemaKind::Long,
+            SchemaTree::Float => SchemaKind::Float,
+            SchemaTree::Double => SchemaKind::Double,
+            SchemaTree::Bytes => SchemaKind::Bytes,
+            SchemaTree::String => SchemaKind::String,
+            SchemaTree::Array(_) => SchemaKind::Array,
+            SchemaTree::Map(_) => SchemaKind::Map,
+            SchemaTree::Union(_) => SchemaKind::Union,
+            SchemaTree::Record{ .. } => SchemaKind::Named,
+            SchemaTree::TypeReference{ .. } => SchemaKind::Named,
+            SchemaTree::Fixed{ .. } => SchemaKind::Named,
+            SchemaTree::Enum{ .. } => SchemaKind::Named,
             
         }
     }
@@ -211,19 +217,6 @@ impl NameRef {
 }
 
 impl Name {
-    /// Create a new `Name`.
-    /// No `namespace` nor `aliases` will be defined.
-    pub fn new(name: &str) -> Name {
-        Name {
-            name: NameRef {
-                name:name.to_owned(),
-                namespace: None,
-            },
-            aliases: None,
-        }
-    }
-
-
     /// Parse a `serde_json::Value` into a `Name`.
     fn parse(complex: &Map<String, Value>, current_namespace: &Option<String>) -> Result<Self, Error> {
         let name_str = complex
@@ -291,7 +284,7 @@ pub struct RecordField {
     /// is enabled.
     pub default: Option<Value>,
     /// Schema of the field.
-    pub schema: Arc<Schema>,
+    pub schema: Arc<SchemaTree>,
     /// Order of the field.
     ///
     /// **NOTE** This currently has no effect.
@@ -318,7 +311,7 @@ impl RecordField {
         let schema = field
             .get("type")
             .ok_or_else(|| ParseSchemaError::new("No `type` in record field").into())
-            .and_then(|type_| Schema::parse_with_context(type_, context))?;
+            .and_then(|type_| SchemaTree::parse_with_context(type_, context))?;
 
         let default = field.get("default").cloned();
 
@@ -346,7 +339,7 @@ impl RecordField {
 #[derive(Clone, Debug, Default)]
 pub struct SchemaParseContext {
     pub(crate) current_namespace: Option<String>,
-    pub(crate) type_registry: HashMap<String, Arc<Schema>>,
+    pub(crate) type_registry: HashMap<String, Arc<SchemaTree>>,
 }
 
 impl SchemaParseContext {
@@ -357,19 +350,31 @@ impl SchemaParseContext {
         }
     }
 
-    pub fn register_type(&mut self, name: &Name, schema: &Arc<Schema>) {
+    pub fn from_reg(type_registry: HashMap<String, Arc<SchemaTree>>) -> Self {
+        Self {
+            current_namespace: None,
+            type_registry,
+        }
+    }
+
+    pub fn register_type(&mut self, name: &Name, schema: &Arc<SchemaTree>) {
         for key in name.fullnames(&self.current_namespace) {
             self.type_registry.insert(key, schema.clone());
         }
     }
-    pub fn lookup_type(&self, name: &NameRef, context: &SchemaParseContext) -> Option<Arc<Schema>> {
+
+    pub fn lookup_type(&self, name: &NameRef, context: &SchemaParseContext) -> Option<Arc<SchemaTree>> {
         self.type_registry.get(&name.fullname(&context.current_namespace)).cloned()
+    }
+
+    pub fn release(self) -> HashMap<String, Arc<SchemaTree>> {
+        self.type_registry
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct UnionSchema {
-    schemas: Vec<Arc<Schema>>,
+    schemas: Vec<Arc<SchemaTree>>,
 
     // this will hold the irrefutable schemata such ans Int or Null
     variant_index: HashMap<SchemaKind, usize>,
@@ -380,13 +385,13 @@ pub struct UnionSchema {
 }
 
 impl UnionSchema {
-    pub(crate) fn new(schemas: Vec<Arc<Schema>>, context: &SchemaParseContext) -> Result<Self, Error> {
+    pub(crate) fn new(schemas: Vec<Arc<SchemaTree>>, context: &SchemaParseContext) -> Result<Self, Error> {
         let mut variant_index = HashMap::new();
         let mut named_index = Vec::new();
         let mut seen_names = HashSet::new();
         
         for (i, schema) in schemas.iter().enumerate() {
-            if let Schema::Union(_) = **schema {
+            if let SchemaTree::Union(_) = **schema {
                 Err(ParseSchemaError::new(
                     "Unions may not directly contain a union",
                 ))?;
@@ -396,10 +401,10 @@ impl UnionSchema {
 
             if let SchemaKind::Named = kind {
                 let names = match **schema {
-                    Schema::Record { ref name, .. } =>  name.fullnames(&context.current_namespace),
-                    Schema::Enum { ref name, .. } => name.fullnames(&context.current_namespace),
-                    Schema::Fixed { ref name, .. } => name.fullnames(&context.current_namespace),
-                    Schema::TypeReference(ref name) => vec!(name.fullname(&context.current_namespace)),
+                    SchemaTree::Record { ref name, .. } =>  name.fullnames(&context.current_namespace),
+                    SchemaTree::Enum { ref name, .. } => name.fullnames(&context.current_namespace),
+                    SchemaTree::Fixed { ref name, .. } => name.fullnames(&context.current_namespace),
+                    SchemaTree::TypeReference(ref name) => vec!(name.fullname(&context.current_namespace)),
                     _ => unreachable!(),
                 };
                 
@@ -429,7 +434,7 @@ impl UnionSchema {
 
 
     /// Returns a slice to all variants of this schema.
-    pub fn variants(&self) -> &[Arc<Schema>] {
+    pub fn variants(&self) -> &[Arc<SchemaTree>] {
         &self.schemas
     }
 
@@ -440,14 +445,12 @@ impl UnionSchema {
 
     /// Optionally returns a reference to the schema matched by this value, as well as its position
     /// within this enum.
-    pub fn find_schema(&self, value: &::types::Value, context: &mut SchemaParseContext) -> Option<(usize, Arc<Schema>)> {
+    pub fn find_schema(&self, value: &::types::Value, context: &mut SchemaParseContext) -> Option<(usize, Arc<SchemaTree>)> {
         let kind = SchemaKind::from(value);
 
         if let SchemaKind::Named = kind {
             for i in &self.named_index {
-                let mut temp_con = context.clone();
-                if value.validate_inner(&self.schemas[*i], &mut temp_con) {
-                    *context = temp_con;
+                if value.validate_inner(&self.schemas[*i], context) {
                     return Some((*i, self.schemas[*i].clone()));
                 }
             }
@@ -471,29 +474,39 @@ impl PartialEq for UnionSchema {
 
 impl Schema {
     /// Create a `Schema` from a string representing a JSON Avro schema.
-    pub fn parse_str(input: &str) -> Result<Self, Error> {
+    pub fn parse_str(input: &str) -> Result<Schema, Error> {
         let value = serde_json::from_str(input)?;
         Self::parse(&value)
     }
 
     /// Create a `Schema` from a `serde_json::Value` representing a JSON Avro
     /// schema.
-    pub fn parse(value: &Value) -> Result<Self, Error> {
-        let res = {
-            let mut context = SchemaParseContext::new();
-            Self::parse_with_context(value, &mut context)
-        };
-
-        res.map(|b| (*b).clone())
+    pub fn parse(value: &Value) -> Result<Schema, Error> {
+        let mut context = SchemaParseContext::new();
+        let tree = SchemaTree::parse_with_context(value, &mut context)?;
+        Ok(Schema {
+            tree,
+            type_reg: context.release(),
+        })
     }
 
-    fn parse_with_context<'a>(value: &'a Value , context: &mut SchemaParseContext) -> Result<Arc<Self>, Error> {
-        match *value {
-            Value::String(ref t) => Schema::parse_type(t.as_str(), context),
-            Value::Object(ref data) => Schema::parse_complex(data, context),
-            Value::Array(ref data) => Schema::parse_union(data, context),
-            _ => Err(ParseSchemaError::new("Must be a JSON string, object or array").into()),
+    pub(crate) fn from_tree(tree: SchemaTree) -> Schema {
+        Schema {
+            tree: Arc::new(tree),
+            type_reg: HashMap::new(),
         }
+    }
+
+    pub(crate) fn inner(&self) -> Arc<SchemaTree> {
+        self.tree.clone()
+    }
+
+    pub(crate) fn ref_inner(&self) -> &SchemaTree {
+        self.tree.as_ref()
+    }
+
+    pub(crate) fn new_context(&self) -> SchemaParseContext {
+        SchemaParseContext::from_reg(self.type_reg.clone())
     }
 
     /// Converts `self` into its [Parsing Canonical Form].
@@ -501,28 +514,39 @@ impl Schema {
     /// [Parsing Canonical Form]:
     /// https://avro.apache.org/docs/1.8.2/spec.html#Parsing+Canonical+Form+for+Schemas
     pub fn canonical_form(&self) -> String {
-        let json = serde_json::to_value(self).unwrap();
+        let json = serde_json::to_value((*self.tree).clone()).unwrap();
         parsing_canonical_form(&json)
+    }
+}
+
+impl SchemaTree {
+    fn parse_with_context(value: &Value , context: &mut SchemaParseContext) -> Result<Arc<Self>, Error> {
+        match value {
+            Value::String(t) => SchemaTree::parse_type(t.as_str(), context),
+            Value::Object(data) => SchemaTree::parse_complex(data, context),
+            Value::Array(data) => SchemaTree::parse_union(data, context),
+            _ => Err(ParseSchemaError::new("Must be a JSON string, object or array").into()),
+        }
     }
 
     /// Parse a `serde_json::Value` representing a primitive Avro type into a
     /// `Schema`.
     fn parse_type(primitive: &str, context: &mut SchemaParseContext) -> Result<Arc<Self>, Error> {
         match primitive {
-            "null" => Ok(Arc::new(Schema::Null)),
-            "boolean" => Ok(Arc::new(Schema::Boolean)),
-            "int" => Ok(Arc::new(Schema::Int)),
-            "long" => Ok(Arc::new(Schema::Long)),
-            "double" => Ok(Arc::new(Schema::Double)),
-            "float" => Ok(Arc::new(Schema::Float)),
-            "bytes" => Ok(Arc::new(Schema::Bytes)),
-            "string" => Ok(Arc::new(Schema::String)),
-            other => Schema::parse_reference(other, context),
+            "null" => Ok(Arc::new(SchemaTree::Null)),
+            "boolean" => Ok(Arc::new(SchemaTree::Boolean)),
+            "int" => Ok(Arc::new(SchemaTree::Int)),
+            "long" => Ok(Arc::new(SchemaTree::Long)),
+            "double" => Ok(Arc::new(SchemaTree::Double)),
+            "float" => Ok(Arc::new(SchemaTree::Float)),
+            "bytes" => Ok(Arc::new(SchemaTree::Bytes)),
+            "string" => Ok(Arc::new(SchemaTree::String)),
+            other => SchemaTree::parse_reference(other, context),
         }
     }
 
     fn parse_reference(reference: &str, context: &mut SchemaParseContext) -> Result<Arc<Self>, Error> {
-        NameRef::parse_str(reference, &context.current_namespace).map(Schema::TypeReference).map(Arc::new)
+        NameRef::parse_str(reference, &context.current_namespace).map(SchemaTree::TypeReference).map(Arc::new)
     }
 
     /// Parse a `serde_json::Value` representing a complex Avro type into a
@@ -533,13 +557,13 @@ impl Schema {
     fn parse_complex(complex: &Map<String, Value>, context: &mut SchemaParseContext) -> Result<Arc<Self>, Error> {
         match complex.get("type") {
             Some(&Value::String(ref t)) => match t.as_str() {
-                "array" => Schema::parse_array(complex, context),
-                "map" => Schema::parse_map(complex, context),
-                "record" | "enum" | "fixed" => Schema::parse_named(complex, context),
-                other => Schema::parse_type(other, context),
+                "array" => SchemaTree::parse_array(complex, context),
+                "map" => SchemaTree::parse_map(complex, context),
+                "record" | "enum" | "fixed" => SchemaTree::parse_named(complex, context),
+                other => SchemaTree::parse_type(other, context),
             },
             Some(&Value::Object(ref data)) => match data.get("type") {
-                Some(ref value) => Schema::parse_with_context(value, context),
+                Some(ref value) => SchemaTree::parse_with_context(value, context),
                 None => Err(
                     ParseSchemaError::new(format!("Unknown complex type: {:?}", complex)).into(),
                 ),
@@ -554,9 +578,9 @@ impl Schema {
 
         let schema = match complex.get("type") {
             Some(&Value::String(ref t)) => match t.as_str() {
-                "record" => Schema::parse_record(complex, context),
-                "enum" => Schema::parse_enum(complex, context),
-                "fixed" => Schema::parse_fixed(complex, context),
+                "record" => SchemaTree::parse_record(complex, context),
+                "enum" => SchemaTree::parse_enum(complex, context),
+                "fixed" => SchemaTree::parse_fixed(complex, context),
                 _ => panic!("parse_named got wrong type"),
             },
             _ => panic!("parse_named got wrong type"),
@@ -594,7 +618,7 @@ impl Schema {
             lookup.insert(field.name.clone(), field.position);
         }
 
-        Ok(Arc::new(Schema::Record {
+        Ok(Arc::new(SchemaTree::Record {
             name,
             doc: complex.doc(),
             fields,
@@ -620,7 +644,7 @@ impl Schema {
                     .ok_or_else(|| ParseSchemaError::new("Unable to parse `symbols` in enum"))
             })?;
 
-        Ok(Arc::new(Schema::Enum {
+        Ok(Arc::new(SchemaTree::Enum {
             name,
             doc: complex.doc(),
             symbols,
@@ -633,8 +657,8 @@ impl Schema {
         complex
             .get("items")
             .ok_or_else(|| ParseSchemaError::new("No `items` in array").into())
-            .and_then(|items| Schema::parse_with_context(items, context))
-            .map(|schema| Arc::new(Schema::Array(schema)))
+            .and_then(|items| SchemaTree::parse_with_context(items, context))
+            .map(|schema| Arc::new(SchemaTree::Array(schema)))
     }
 
     /// Parse a `serde_json::Value` representing a Avro map type into a
@@ -643,18 +667,18 @@ impl Schema {
         complex
             .get("values")
             .ok_or_else(|| ParseSchemaError::new("No `values` in map").into())
-            .and_then(|items| Schema::parse_with_context(items, context))
-            .map(|schema| Arc::new(Schema::Map(schema)))
+            .and_then(|items| SchemaTree::parse_with_context(items, context))
+            .map(|schema| Arc::new(SchemaTree::Map(schema)))
     }
 
     /// Parse a `serde_json::Value` representing a Avro union type into a
     /// `Schema`.
-    fn parse_union(items: &[Value], context: &SchemaParseContext) -> Result<Arc<Self>, Error> {
+    fn parse_union(items: &[Value], context: &mut SchemaParseContext) -> Result<Arc<Self>, Error> {
         items
             .iter()
-            .map(|s| Schema::parse(s).map(Arc::new))
+            .map(|s| SchemaTree::parse_with_context(s, context))
             .collect::<Result<Vec<_>, _>>()
-            .and_then(|schemas| Ok(Arc::new(Schema::Union(UnionSchema::new(schemas, context)?))))
+            .and_then(|schemas| Ok(Arc::new(SchemaTree::Union(UnionSchema::new(schemas, context)?))))
     }
 
     /// Parse a `serde_json::Value` representing a Avro fixed type into a
@@ -668,41 +692,41 @@ impl Schema {
             .and_then(|v| v.as_i64())
             .ok_or_else(|| ParseSchemaError::new("No `size` in fixed"))?;
 
-        Ok(Arc::new(Schema::Fixed {
+        Ok(Arc::new(SchemaTree::Fixed {
             name,
             size: size as usize,
         }))
     }
 }
 
-impl Serialize for Schema {
+impl Serialize for SchemaTree {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         match *self {
-            Schema::Null => serializer.serialize_str("null"),
-            Schema::Boolean => serializer.serialize_str("boolean"),
-            Schema::Int => serializer.serialize_str("int"),
-            Schema::Long => serializer.serialize_str("long"),
-            Schema::Float => serializer.serialize_str("float"),
-            Schema::Double => serializer.serialize_str("double"),
-            Schema::TypeReference(ref name) => serializer.serialize_str(&name.fullname(&None)),
-            Schema::Bytes => serializer.serialize_str("bytes"),
-            Schema::String => serializer.serialize_str("string"),
-            Schema::Array(ref inner) => {
+            SchemaTree::Null => serializer.serialize_str("null"),
+            SchemaTree::Boolean => serializer.serialize_str("boolean"),
+            SchemaTree::Int => serializer.serialize_str("int"),
+            SchemaTree::Long => serializer.serialize_str("long"),
+            SchemaTree::Float => serializer.serialize_str("float"),
+            SchemaTree::Double => serializer.serialize_str("double"),
+            SchemaTree::TypeReference(ref name) => serializer.serialize_str(&name.fullname(&None)),
+            SchemaTree::Bytes => serializer.serialize_str("bytes"),
+            SchemaTree::String => serializer.serialize_str("string"),
+            SchemaTree::Array(ref inner) => {
                 let mut map = serializer.serialize_map(Some(2))?;
                 map.serialize_entry("type", "array")?;
                 map.serialize_entry("items", &*inner.clone())?;
                 map.end()
             },
-            Schema::Map(ref inner) => {
+            SchemaTree::Map(ref inner) => {
                 let mut map = serializer.serialize_map(Some(2))?;
                 map.serialize_entry("type", "map")?;
                 map.serialize_entry("values", &*inner.clone())?;
                 map.end()
             },
-            Schema::Union(ref inner) => {
+            SchemaTree::Union(ref inner) => {
                 let variants = inner.variants();
                 let mut seq = serializer.serialize_seq(Some(variants.len()))?;
                 for v in variants {
@@ -710,7 +734,7 @@ impl Serialize for Schema {
                 }
                 seq.end()
             },
-            Schema::Record {
+            SchemaTree::Record {
                 ref name,
                 ref doc,
                 ref fields,
@@ -731,7 +755,7 @@ impl Serialize for Schema {
                 map.serialize_entry("fields", fields)?;
                 map.end()
             },
-            Schema::Enum {
+            SchemaTree::Enum {
                 ref name,
                 ref symbols,
                 ..
@@ -742,7 +766,7 @@ impl Serialize for Schema {
                 map.serialize_entry("symbols", symbols)?;
                 map.end()
             },
-            Schema::Fixed { ref name, ref size } => {
+            SchemaTree::Fixed { ref name, ref size } => {
                 let mut map = serializer.serialize_map(None)?;
                 map.serialize_entry("type", "fixed")?;
                 map.serialize_entry("name", &name.name.name)?;
@@ -874,6 +898,10 @@ fn field_ordering_position(field: &str) -> Option<usize> {
 mod tests {
     use super::*;
 
+    fn parse(s: &str) -> Schema {
+        Schema::parse_str(s).unwrap()
+    }
+
     #[test]
     fn test_invalid_schema() {
         assert!(Schema::parse_str("invalid").is_err());
@@ -881,29 +909,29 @@ mod tests {
 
     #[test]
     fn test_primitive_schema() {
-        assert_eq!(Schema::Null, Schema::parse_str("\"null\"").unwrap());
-        assert_eq!(Schema::Int, Schema::parse_str("\"int\"").unwrap());
-        assert_eq!(Schema::Double, Schema::parse_str("\"double\"").unwrap());
+        assert_eq!(SchemaTree::Null, *parse("\"null\"").ref_inner());
+        assert_eq!(SchemaTree::Int, *parse("\"int\"").ref_inner());
+        assert_eq!(SchemaTree::Double, *parse("\"double\"").ref_inner());
     }
 
     #[test]
     fn test_array_schema() {
-        let schema = Schema::parse_str(r#"{"type": "array", "items": "string"}"#).unwrap();
-        assert_eq!(Schema::Array(Arc::new(Schema::String)), schema);
+        let schema = parse(r#"{"type": "array", "items": "string"}"#);
+        assert_eq!(SchemaTree::Array(Arc::new(SchemaTree::String)), *schema.ref_inner());
     }
 
     #[test]
     fn test_map_schema() {
-        let schema = Schema::parse_str(r#"{"type": "map", "values": "double"}"#).unwrap();
-        assert_eq!(Schema::Map(Arc::new(Schema::Double)), schema);
+        let schema = parse(r#"{"type": "map", "values": "double"}"#);
+        assert_eq!(SchemaTree::Map(Arc::new(SchemaTree::Double)), *schema.ref_inner());
     }
 
     #[test]
     fn test_union_schema() {
-        let schema = Schema::parse_str(r#"["null", "int"]"#).unwrap();
+        let schema = parse(r#"["null", "int"]"#);
         assert_eq!(
-            Schema::Union(UnionSchema::new(vec![Arc::new(Schema::Null), Arc::new(Schema::Int)], &SchemaParseContext::new()).unwrap()),
-            schema
+            SchemaTree::Union(UnionSchema::new(vec![Arc::new(SchemaTree::Null), Arc::new(SchemaTree::Int)], &SchemaParseContext::new()).unwrap()),
+            *schema.ref_inner()
         );
     }
 
@@ -918,9 +946,10 @@ mod tests {
         let schema = Schema::parse_str(r#"["null", "int", "float", "string", "bytes"]"#);
         assert!(schema.is_ok());
         let schema = schema.unwrap();
-        assert_eq!(SchemaKind::from(&schema), SchemaKind::Union);
-        let union_schema = match schema {
-            Schema::Union(u) => u,
+        let schema_inner = schema.ref_inner();
+        assert_eq!(SchemaKind::from(schema_inner), SchemaKind::Union);
+        let union_schema = match schema_inner {
+            SchemaTree::Union(u) => u,
             _ => unreachable!(),
         };
         assert_eq!(union_schema.variants().len(), 5);
@@ -944,7 +973,7 @@ mod tests {
 
     #[test]
     fn test_record_schema() {
-        let schema = Schema::parse_str(
+        let schema = parse(
             r#"
             {
                 "type": "record",
@@ -955,13 +984,13 @@ mod tests {
                 ]
             }
         "#,
-        ).unwrap();
+        );
 
         let mut lookup = HashMap::new();
         lookup.insert("a".to_owned(), 0);
         lookup.insert("b".to_owned(), 1);
 
-        let expected = Schema::Record {
+        let expected = SchemaTree::Record {
             name: Name::new("test"),
             doc: None,
             fields: vec![
@@ -969,7 +998,7 @@ mod tests {
                     name: "a".to_string(),
                     doc: None,
                     default: Some(Value::Number(42i64.into())),
-                    schema: Arc::new(Schema::Long),
+                    schema: Arc::new(SchemaTree::Long),
                     order: RecordFieldOrder::Ascending,
                     position: 0,
                 },
@@ -977,7 +1006,7 @@ mod tests {
                     name: "b".to_string(),
                     doc: None,
                     default: None,
-                    schema: Arc::new(Schema::String),
+                    schema: Arc::new(SchemaTree::String),
                     order: RecordFieldOrder::Ascending,
                     position: 1,
                 },
@@ -985,16 +1014,16 @@ mod tests {
             lookup,
         };
 
-        assert_eq!(expected, schema);
+        assert_eq!(expected, *schema.ref_inner());
     }
 
     #[test]
     fn test_enum_schema() {
-        let schema = Schema::parse_str(
+        let schema = parse(
             r#"{"type": "enum", "name": "Suit", "symbols": ["diamonds", "spades", "clubs", "hearts"]}"#,
-        ).unwrap();
+        );
 
-        let expected = Schema::Enum {
+        let expected = SchemaTree::Enum {
             name: Name::new("Suit"),
             doc: None,
             symbols: vec![
@@ -1005,24 +1034,24 @@ mod tests {
             ],
         };
 
-        assert_eq!(expected, schema);
+        assert_eq!(expected, *schema.ref_inner());
     }
 
     #[test]
     fn test_fixed_schema() {
-        let schema = Schema::parse_str(r#"{"type": "fixed", "name": "test", "size": 16}"#).unwrap();
+        let schema = parse(r#"{"type": "fixed", "name": "test", "size": 16}"#);
 
-        let expected = Schema::Fixed {
+        let expected = SchemaTree::Fixed {
             name: Name::new("test"),
             size: 16usize,
         };
 
-        assert_eq!(expected, schema);
+        assert_eq!(expected, *schema.ref_inner());
     }
 
     #[test]
     fn test_parse_recursive_schema() {
-        let _schema = Schema::parse_str(r#"
+        let schema = Schema::parse_str(r#"
                      {
                        "type": "record",
                        "name": "test",
@@ -1032,13 +1061,13 @@ mod tests {
                            "type": ["null", "test"]
                          }
                        ]
-                     }"#).unwrap();
-
+                     }"#);
+        assert!(schema.is_ok());
     }
 
     #[test]
     fn test_nested_named_fixed_schema() {
-        let schema = Schema::parse_str(
+        let schema = parse(
             r#"
             {
                 "type": "record",
@@ -1060,13 +1089,13 @@ mod tests {
                 ]
             }
         "#,
-        ).unwrap();
+        );
 
         let mut lookup = HashMap::new();
         lookup.insert("a".to_owned(), 0);
         lookup.insert("b".to_owned(), 1);
 
-        let expected = Schema::Record {
+        let expected = SchemaTree::Record {
             name: Name::new("test"),
             doc: None,
             fields: vec![
@@ -1074,7 +1103,7 @@ mod tests {
                     name: "a".to_string(),
                     doc: None,
                     default: None,
-                    schema: Arc::new(Schema::Fixed {
+                    schema: Arc::new(SchemaTree::Fixed {
                         name: Name {
                             name: NameRef::parse_str("fixed_test", &Some("com.test".to_string())).unwrap(),
                             aliases: None,
@@ -1088,7 +1117,7 @@ mod tests {
                     name: "b".to_string(),
                     doc: None,
                     default: None,
-                    schema: Arc::new(Schema::TypeReference(NameRef::parse_str("fixed_test", &Some("com.test".to_string())).unwrap())),
+                    schema: Arc::new(SchemaTree::TypeReference(NameRef::parse_str("fixed_test", &Some("com.test".to_string())).unwrap())),
                     order: RecordFieldOrder::Ascending,
                     position: 1,
                 },
@@ -1096,7 +1125,7 @@ mod tests {
             lookup: lookup,
         };
 
-        assert_eq!(expected, schema);
+        assert_eq!(expected, *schema.ref_inner());
     }
 
     #[test]
@@ -1107,7 +1136,7 @@ mod tests {
         lookup.insert("three".to_owned(), 2);
         lookup.insert("four".to_owned(), 3);
 
-        let schema = Schema::parse_str(
+        let schema = parse(
             r#"{ "type": "record",
                  "name": "top",
                  "namespace": "com.example",
@@ -1140,9 +1169,9 @@ mod tests {
                              }
                    }
                  ]
-               }"#).unwrap();
+               }"#);
 
-        let expected = Schema::Record {
+        let expected = SchemaTree::Record {
             name: Name { name: NameRef::parse_str("com.example.top", &None).unwrap(), aliases: None },
             doc: None,
             fields: vec![
@@ -1150,7 +1179,7 @@ mod tests {
                     name: "one".to_string(),
                     doc: None,
                     default: None,
-                    schema: Arc::new(Schema::Record{
+                    schema: Arc::new(SchemaTree::Record{
                         name: Name { name: NameRef::parse_str("com.example.one", &None).unwrap(), aliases: None },
                         doc: None,
                         fields: Vec::new(),
@@ -1163,7 +1192,7 @@ mod tests {
                     name: "two".to_string(),
                     doc: None,
                     default: None,
-                    schema: Arc::new(Schema::Record{
+                    schema: Arc::new(SchemaTree::Record{
                         name: Name { name: NameRef::parse_str("biz.good.two", &None).unwrap(), aliases: None },
                         doc: None,
                         fields: Vec::new(),
@@ -1176,7 +1205,7 @@ mod tests {
                     name: "three".to_string(),
                     doc: None,
                     default: None,
-                    schema: Arc::new(Schema::Record{
+                    schema: Arc::new(SchemaTree::Record{
                         name: Name { name: NameRef::parse_str("com.example.sub.three", &None).unwrap(), aliases: None },
                         doc: None,
                         fields: Vec::new(),
@@ -1189,7 +1218,7 @@ mod tests {
                     name: "four".to_string(),
                     doc: None,
                     default: None,
-                    schema: Arc::new(Schema::Record{
+                    schema: Arc::new(SchemaTree::Record{
                         name: Name { name: NameRef::parse_str("four.five", &None).unwrap(), aliases: None },
                         doc: None,
                         fields: Vec::new(),
@@ -1202,17 +1231,16 @@ mod tests {
             lookup: lookup,
         };
 
-        assert_eq!(expected, schema);
+        assert_eq!(expected, *schema.ref_inner());
     }
 
     #[test]
     fn test_no_documentation() {
         let schema =
-            Schema::parse_str(r#"{"type": "enum", "name": "Coin", "symbols": ["heads", "tails"]}"#)
-                .unwrap();
+            parse(r#"{"type": "enum", "name": "Coin", "symbols": ["heads", "tails"]}"#);
 
-        let doc = match schema {
-            Schema::Enum { doc, .. } => doc,
+        let doc = match schema.ref_inner() {
+            SchemaTree::Enum { doc, .. } => doc,
             _ => return assert!(false),
         };
 
@@ -1221,13 +1249,13 @@ mod tests {
 
     #[test]
     fn test_documentation() {
-        let schema = Schema::parse_str(
+        let schema = parse(
             r#"{"type": "enum", "name": "Coin", "doc": "Some documentation", "symbols": ["heads", "tails"]}"#
-        ).unwrap();
+        );
 
-        let doc = match schema {
-            Schema::Enum { doc, .. } => doc,
-            _ => None,
+        let doc = match schema.ref_inner() {
+            SchemaTree::Enum { doc, .. } => doc,
+            _ => &None,
         };
 
         assert_eq!("Some documentation".to_owned(), doc.unwrap());
@@ -1239,7 +1267,7 @@ mod tests {
     fn test_schema_is_send() {
         fn send<S: Send>(_s: S) {}
 
-        let schema = Schema::Null;
+        let schema = SchemaTree::Null;
         send(schema);
     }
 
@@ -1247,7 +1275,7 @@ mod tests {
     fn test_schema_is_sync() {
         fn sync<S: Sync>(_s: S) {}
 
-        let schema = Schema::Null;
+        let schema = SchemaTree::Null;
         sync(&schema);
         sync(schema);
     }

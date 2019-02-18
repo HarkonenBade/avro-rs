@@ -7,7 +7,7 @@ use failure::Error;
 use serde_json::from_slice;
 
 use decode::decode;
-use schema::{ParseSchemaError, Schema, SchemaParseContext};
+use schema::{ParseSchemaError, Schema, SchemaParseContext, SchemaTree};
 use types::Value;
 use util::{self, DecodeError};
 use Codec;
@@ -23,7 +23,7 @@ struct Block<R> {
     message_count: usize,
     marker: [u8; 16],
     codec: Codec,
-    writer_schema: Arc<Schema>,
+    writer_schema: Schema,
 }
 
 impl<R: Read> Block<R> {
@@ -31,7 +31,7 @@ impl<R: Read> Block<R> {
         let mut block = Block {
             reader,
             codec: Codec::Null,
-            writer_schema: Arc::new(Schema::Null),
+            writer_schema: Schema::from_tree(SchemaTree::Null),
             buf: vec![],
             buf_idx: 0,
             message_count: 0,
@@ -45,7 +45,7 @@ impl<R: Read> Block<R> {
     /// Try to read the header and to set the writer `Schema`, the `Codec` and the marker based on
     /// its content.
     fn read_header(&mut self) -> Result<(), Error> {
-        let meta_schema = Arc::new(Schema::Map(Arc::new(Schema::Bytes)));
+        let meta_schema = Arc::new(SchemaTree::Map(Arc::new(SchemaTree::Bytes)));
 
         let mut buf = [0u8; 4];
         self.reader.read_exact(&mut buf)?;
@@ -67,7 +67,7 @@ impl<R: Read> Block<R> {
                 })
                 .and_then(|json| Schema::parse(&json).ok());
             if let Some(schema) = schema {
-                self.writer_schema = Arc::new(schema);
+                self.writer_schema = schema;
             } else {
                 return Err(ParseSchemaError::new("unable to parse schema").into())
             }
@@ -155,7 +155,7 @@ impl<R: Read> Block<R> {
         self.len() == 0
     }
 
-    fn read_next(&mut self, read_schema: &Option<Arc<Schema>>) -> Result<Option<Value>, Error> {
+    fn read_next(&mut self, read_schema: &Option<Schema>) -> Result<Option<Value>, Error> {
         if self.is_empty() {
             self.read_block_next()?;
             if self.is_empty() {
@@ -189,7 +189,7 @@ impl<R: Read> Block<R> {
 /// ```
 pub struct Reader<R> {
     block: Block<R>,
-    reader_schema: Option<Arc<Schema>>,
+    reader_schema: Option<Schema>,
     errored: bool,
     should_resolve_schema: bool,
 }
@@ -218,7 +218,7 @@ impl<R: Read> Reader<R> {
         let block = Block::new(reader)?;
         let mut reader = Reader {
             block,
-            reader_schema: Some(Arc::new(schema.clone())),
+            reader_schema: Some(schema.clone()),
             errored: false,
             should_resolve_schema: false,
         };
@@ -233,7 +233,7 @@ impl<R: Read> Reader<R> {
     }
 
     /// Get a reference to the optional reader `Schema`.
-    pub fn reader_schema(&self) -> Option<Arc<Schema>> {
+    pub fn reader_schema(&self) -> Option<Schema> {
         self.reader_schema.clone()
     }
 
@@ -276,15 +276,15 @@ impl<'a, R: Read> Iterator for Reader<R> {
 /// header and consecutive data blocks; use [`Reader`](struct.Reader.html) if you don't know what
 /// you are doing, instead.
 pub fn from_avro_datum<R: Read>(
-    writer_schema: &Arc<Schema>,
+    writer_schema: &Schema,
     reader: &mut R,
-    reader_schema: &Option<Arc<Schema>>,
+    reader_schema: &Option<Schema>,
 ) -> Result<Value, Error> {
-    let value = decode(&writer_schema, reader, &mut SchemaParseContext::new())?;
+    let value = decode(&writer_schema.inner(), reader, &mut SchemaParseContext::new())?;
     match reader_schema {
         Some(ref schema) => {
             let mut context = SchemaParseContext::new();
-            value.resolve(schema, &mut context)
+            value.resolve(&schema.inner(), &mut context)
         },
         None => Ok(value),
     }

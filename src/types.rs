@@ -6,7 +6,7 @@ use std::sync::Arc;
 use failure::Error;
 use serde_json::Value as JsonValue;
 
-use schema::{RecordField, Schema, SchemaKind, SchemaParseContext, UnionSchema};
+use schema::{RecordField, Schema, SchemaKind, SchemaTree, SchemaParseContext, UnionSchema};
 
 /// Describes errors happened while performing schema resolution on Avro data.
 #[derive(Fail, Debug)]
@@ -186,14 +186,14 @@ impl<'a> Record<'a> {
     ///
     /// If the `Schema` is not a `Schema::Record` variant, `None` will be returned.
     pub fn new<'b>(schema: &'b Schema) -> Option<Record<'b>> {
-        Self::new_with_placeholder(schema, &Value::Null)
+        Self::with_placeholder(schema, &Value::Null)
     }
 
-    pub fn new_with_placeholder<'b>(schema: &'b Schema, placeholder: &Value) -> Option<Record<'b>> {
-        match *schema {
-            Schema::Record {
-                fields: ref schema_fields,
-                lookup: ref schema_lookup,
+    pub fn with_placeholder<'b>(schema: &'b Schema, placeholder: &Value) -> Option<Record<'b>> {
+        match schema.ref_inner() {
+            SchemaTree::Record {
+                fields: schema_fields,
+                lookup: schema_lookup,
                 ..
             } => {
                 let mut fields = Vec::with_capacity(schema_fields.len());
@@ -260,64 +260,61 @@ impl Value {
     /// See the [Avro specification](https://avro.apache.org/docs/current/spec.html)
     /// for the full set of rules of schema validation.
     pub fn validate(&self, schema: &Schema) -> bool {
-        self.validate_inner(&Arc::new(schema.clone()), &mut SchemaParseContext::new())
+        let mut context = schema.new_context();
+        self.validate_inner(&schema.inner(), &mut context)
     }
 
-    pub(crate) fn validate_inner(&self, schema: &Arc<Schema>, context: &mut SchemaParseContext) -> bool {
+    pub(crate) fn validate_inner(&self, schema: &Arc<SchemaTree>, context: &mut SchemaParseContext) -> bool {
 
         match (self, &**schema) {
-            (&Value::Null, Schema::Null) => true,
-            (&Value::Boolean(_), Schema::Boolean) => true,
-            (&Value::Int(_), Schema::Int) => true,
-            (&Value::Long(_), Schema::Long) => true,
-            (&Value::Float(_), Schema::Float) => true,
-            (&Value::Double(_), Schema::Double) => true,
-            (&Value::Bytes(_), Schema::Bytes) => true,
-            (&Value::String(_), Schema::String) => true,
-            (&Value::Fixed(n, _), Schema::Fixed { ref name, size }) => {
-                context.register_type(name, schema);
+            (&Value::Null, SchemaTree::Null) => true,
+            (&Value::Boolean(_), SchemaTree::Boolean) => true,
+            (&Value::Int(_), SchemaTree::Int) => true,
+            (&Value::Long(_), SchemaTree::Long) => true,
+            (&Value::Float(_), SchemaTree::Float) => true,
+            (&Value::Double(_), SchemaTree::Double) => true,
+            (&Value::Bytes(_), SchemaTree::Bytes) => true,
+            (&Value::String(_), SchemaTree::String) => true,
+            (&Value::Fixed(n, _), SchemaTree::Fixed { ref name, size }) => {
                 if let Some(_) = name.name.namespace {
                     context.current_namespace = name.name.namespace.clone();
                 }
                 trace!("Val: Fixed({}) vs Fixed({:?}, {})", n, name, size);
                 n == *size
             },
-            (&Value::String(ref s), Schema::Enum { ref symbols, ref name, .. }) => {
-                context.register_type(name, schema);
+            (&Value::String(ref s), SchemaTree::Enum { ref symbols, ref name, .. }) => {
                 if let Some(_) = name.name.namespace {
                     context.current_namespace = name.name.namespace.clone();
                 }
                 trace!("Val: String({}) vs Enum({:?})", s, name);
                 symbols.contains(s)
             },
-            (&Value::Enum(i, ref s), Schema::Enum { ref symbols, ref name, .. }) => {
+            (&Value::Enum(i, ref s), SchemaTree::Enum { ref symbols, ref name, .. }) => {
                 if let Some(_) = name.name.namespace {
                     context.current_namespace = name.name.namespace.clone();
                 }
-                context.register_type(name, schema);
                 trace!("Val: Enum({}) vs Enum({:?})", s, name);
                 symbols
                     .get(i as usize)
                     .map(|ref symbol| symbol == &s)
                     .unwrap_or(false)
             },
-            (&Value::Union(ref value), Schema::Union(ref inner)) => {
+            (&Value::Union(ref value), SchemaTree::Union(ref inner)) => {
                 trace!("Val: Union({:?}) vs Union({:?})", value, inner);
                 inner.find_schema(value, context).is_some()
             },
-            (&Value::Array(ref items), Schema::Array(ref inner)) => {
+            (&Value::Array(ref items), SchemaTree::Array(ref inner)) => {
                 trace!("Val: Array() vs Array()");
                 items.iter().all(|item| item.validate_inner(inner, context))
             },
-            (&Value::Map(ref items), Schema::Map(ref inner)) => {
+            (&Value::Map(ref items), SchemaTree::Map(ref inner)) => {
                 trace!("Val: Map() vs Map()");
                 items.iter().all(|(_, value)| value.validate_inner(inner, context))
             },
-            (&Value::Record(ref record_fields), Schema::Record { ref fields, ref name, .. }) => {
+            (&Value::Record(ref record_fields), SchemaTree::Record { ref fields, ref name, .. }) => {
                 if let Some(_) = name.name.namespace {
                     context.current_namespace = name.name.namespace.clone();
                 }
-                context.register_type(name, schema);
                 trace!("Val: Record({:?}) vs Record({:?})", record_fields, name);
                 fields.len() == record_fields.len() && fields.iter().zip(record_fields.iter()).all(
                     |(field, &(ref name, ref value))| {
@@ -325,18 +322,18 @@ impl Value {
                     },
                 )
             },
-            (r @ Value::Record(..), Schema::Union(ref inner)) => {
+            (r @ Value::Record(..), SchemaTree::Union(ref inner)) => {
                 trace!("Val: Record() vs Union()");
                 inner.find_schema(r, context).is_some()
             },
-            (&Value::Record(_), Schema::TypeReference (ref name)) => {
+            (&Value::Record(_), SchemaTree::TypeReference (ref name)) => {
                 trace!("Val: Record() vs Ref({:?})", name);
                 match context.lookup_type(name, context) {
                     Some(ref s) => self.validate_inner(s, context),
                     None => false
                 }
             },
-            (&Value::Fixed(n, _), Schema::TypeReference (ref name)) => {
+            (&Value::Fixed(n, _), SchemaTree::TypeReference (ref name)) => {
                 trace!("Val: Fixed({}) vs Ref({:?})", n, name);
                 match context.lookup_type(name, context) {
                     Some(ref s) => self.validate_inner(s, context),
@@ -356,7 +353,7 @@ impl Value {
     /// See [Schema Resolution](https://avro.apache.org/docs/current/spec.html#Schema+Resolution)
     /// in the Avro specification for the full set of rules of schema
     /// resolution.
-    pub fn resolve(mut self, schema: &Arc<Schema>, context: &mut SchemaParseContext) -> Result<Self, Error> {
+    pub fn resolve(mut self, schema: &Arc<SchemaTree>, context: &mut SchemaParseContext) -> Result<Self, Error> {
         // Check if this schema is a union, and if the reader schema is not.
         if SchemaKind::from(&self) == SchemaKind::Union
             && SchemaKind::from(&**schema) != SchemaKind::Union
@@ -369,24 +366,23 @@ impl Value {
             self = v;
         }
         match **schema {
-            Schema::Null => self.resolve_null(),
-            Schema::Boolean => self.resolve_boolean(),
-            Schema::Int => self.resolve_int(),
-            Schema::Long => self.resolve_long(),
-            Schema::Float => self.resolve_float(),
-            Schema::Double => self.resolve_double(),
-            Schema::Bytes => self.resolve_bytes(),
-            Schema::String => self.resolve_string(),
-            Schema::Fixed { size, .. } => self.resolve_fixed(size),
-            Schema::Union(ref inner) => self.resolve_union(&inner.clone(), context),
-            Schema::Enum { ref symbols, .. } => self.resolve_enum(symbols),
-            Schema::Array(ref inner) => self.resolve_array(inner, context),
-            Schema::Map(ref inner) => self.resolve_map(inner, context),
-            Schema::Record { ref fields, ref name, .. } => {
-                context.register_type(name, schema);
+            SchemaTree::Null => self.resolve_null(),
+            SchemaTree::Boolean => self.resolve_boolean(),
+            SchemaTree::Int => self.resolve_int(),
+            SchemaTree::Long => self.resolve_long(),
+            SchemaTree::Float => self.resolve_float(),
+            SchemaTree::Double => self.resolve_double(),
+            SchemaTree::Bytes => self.resolve_bytes(),
+            SchemaTree::String => self.resolve_string(),
+            SchemaTree::Fixed { size, .. } => self.resolve_fixed(size),
+            SchemaTree::Union(ref inner) => self.resolve_union(&inner.clone(), context),
+            SchemaTree::Enum { ref symbols, .. } => self.resolve_enum(symbols),
+            SchemaTree::Array(ref inner) => self.resolve_array(inner, context),
+            SchemaTree::Map(ref inner) => self.resolve_map(inner, context),
+            SchemaTree::Record { ref fields,  .. } => {
                 self.resolve_record(fields, context)
             } ,
-            Schema::TypeReference(ref name) => context.lookup_type(name, &context)
+            SchemaTree::TypeReference(ref name) => context.lookup_type(name, &context)
                 .map_or_else(|| Err(SchemaResolutionError::new(format!("Couldn't resolve type reference: {:?}", name)).into()),
                              |s| self.resolve(&s, context)),
 
@@ -536,7 +532,7 @@ impl Value {
         v.resolve(&inner, context)
     }
 
-    fn resolve_array(self, schema: &Arc<Schema>, context: &mut SchemaParseContext) -> Result<Self, Error> {
+    fn resolve_array(self, schema: &Arc<SchemaTree>, context: &mut SchemaParseContext) -> Result<Self, Error> {
         match self {
             Value::Array(items) => Ok(Value::Array(items
                 .into_iter()
@@ -549,7 +545,7 @@ impl Value {
         }
     }
 
-    fn resolve_map(self, schema: &Arc<Schema>, context: &mut SchemaParseContext) -> Result<Self, Error> {
+    fn resolve_map(self, schema: &Arc<SchemaTree>, context: &mut SchemaParseContext) -> Result<Self, Error> {
         match self {
             Value::Map(items) => Ok(Value::Map(items
                 .into_iter()
@@ -579,7 +575,7 @@ impl Value {
                     Some(value) => value,
                     None => match field.default {
                         Some(ref value) => match *field.schema {
-                            Schema::Enum { ref symbols, .. } => {
+                            SchemaTree::Enum { ref symbols, .. } => {
                                 value.clone().avro().resolve_enum(symbols)?
                             },
                             _ => value.clone().avro(),
@@ -609,59 +605,59 @@ mod tests {
     #[test]
     fn validate() {
         let value_schema_valid = vec![
-            (Value::Int(42), Schema::Int, true),
-            (Value::Int(42), Schema::Boolean, false),
+            (Value::Int(42), SchemaTree::Int, true),
+            (Value::Int(42), SchemaTree::Boolean, false),
             (
                 Value::Union(Box::new(Value::Null)),
-                Schema::Union(UnionSchema::new(vec![Arc::new(Schema::Null), Arc::new(Schema::Int)], &SchemaParseContext::new()).unwrap()),
+                SchemaTree::Union(UnionSchema::new(vec![Arc::new(SchemaTree::Null), Arc::new(SchemaTree::Int)], &SchemaParseContext::new()).unwrap()),
                 true,
             ),
             (
                 Value::Union(Box::new(Value::Int(42))),
-                Schema::Union(UnionSchema::new(vec![Arc::new(Schema::Null), Arc::new(Schema::Int)], &SchemaParseContext::new()).unwrap()),
+                SchemaTree::Union(UnionSchema::new(vec![Arc::new(SchemaTree::Null), Arc::new(SchemaTree::Int)], &SchemaParseContext::new()).unwrap()),
                 true,
             ),
             (
                 Value::Union(Box::new(Value::Null)),
-                Schema::Union(UnionSchema::new(vec![Arc::new(Schema::Double), Arc::new(Schema::Int)], &SchemaParseContext::new()).unwrap()),
+                SchemaTree::Union(UnionSchema::new(vec![Arc::new(SchemaTree::Double), Arc::new(SchemaTree::Int)], &SchemaParseContext::new()).unwrap()),
                 false,
             ),
             (
                 Value::Union(Box::new(Value::Int(42))),
-                Schema::Union(
+                SchemaTree::Union(
                     UnionSchema::new(vec![
-                        Arc::new(Schema::Null),
-                        Arc::new(Schema::Double),
-                        Arc::new(Schema::String),
-                        Arc::new(Schema::Int),
+                        Arc::new(SchemaTree::Null),
+                        Arc::new(SchemaTree::Double),
+                        Arc::new(SchemaTree::String),
+                        Arc::new(SchemaTree::Int),
                     ], &SchemaParseContext::new()).unwrap(),
                 ),
                 true,
             ),
             (
                 Value::Array(vec![Value::Long(42i64)]),
-                Schema::Array(Arc::new(Schema::Long)),
+                SchemaTree::Array(Arc::new(SchemaTree::Long)),
                 true,
             ),
             (
                 Value::Array(vec![Value::Boolean(true)]),
-                Schema::Array(Arc::new(Schema::Long)),
+                SchemaTree::Array(Arc::new(SchemaTree::Long)),
                 false,
             ),
-            (Value::Record(vec![]), Schema::Null, false),
+            (Value::Record(vec![]), SchemaTree::Null, false),
         ];
 
         for (value, schema, valid) in value_schema_valid.into_iter() {
-            assert_eq!(valid, value.validate(&schema));
+            assert_eq!(valid, value.validate(&Schema::from_tree(schema)));
         }
     }
 
     #[test]
     fn validate_fixed() {
-        let schema = Schema::Fixed {
+        let schema = Schema::from_tree(SchemaTree::Fixed {
             size: 4,
             name: Name::new("some_fixed"),
-        };
+        });
 
         assert!(Value::Fixed(4, vec![0, 0, 0, 0]).validate(&schema));
         assert!(!Value::Fixed(5, vec![0, 0, 0, 0, 0]).validate(&schema));
@@ -669,7 +665,7 @@ mod tests {
 
     #[test]
     fn validate_enum() {
-        let schema = Schema::Enum {
+        let schema = Schema::from_tree(SchemaTree::Enum {
             name: Name::new("some_enum"),
             doc: None,
             symbols: vec![
@@ -678,7 +674,7 @@ mod tests {
                 "diamonds".to_string(),
                 "clubs".to_string(),
             ],
-        };
+        });
 
         assert!(Value::Enum(0, "spades".to_string()).validate(&schema));
         assert!(Value::String("spades".to_string()).validate(&schema));
@@ -686,7 +682,7 @@ mod tests {
         assert!(!Value::Enum(1, "spades".to_string()).validate(&schema));
         assert!(!Value::String("lorem".to_string()).validate(&schema));
 
-        let other_schema = Schema::Enum {
+        let other_schema = Schema::from_tree(SchemaTree::Enum {
             name: Name::new("some_other_enum"),
             doc: None,
             symbols: vec![
@@ -695,7 +691,7 @@ mod tests {
                 "clubs".to_string(),
                 "spades".to_string(),
             ],
-        };
+        });
 
         assert!(!Value::Enum(0, "spades".to_string()).validate(&other_schema));
     }
@@ -709,7 +705,7 @@ mod tests {
         //      {"type": "string", "name": "b"}
         //    ]
         // }
-        let schema = Schema::Record {
+        let schema = Schema::from_tree(SchemaTree::Record {
             name: Name::new("some_record"),
             doc: None,
             fields: vec![
@@ -717,7 +713,7 @@ mod tests {
                     name: "a".to_string(),
                     doc: None,
                     default: None,
-                    schema: Arc::new(Schema::Long),
+                    schema: Arc::new(SchemaTree::Long),
                     order: RecordFieldOrder::Ascending,
                     position: 0,
                 },
@@ -725,13 +721,13 @@ mod tests {
                     name: "b".to_string(),
                     doc: None,
                     default: None,
-                    schema: Arc::new(Schema::String),
+                    schema: Arc::new(SchemaTree::String),
                     order: RecordFieldOrder::Ascending,
                     position: 1,
                 },
             ],
             lookup: HashMap::new(),
-        };
+        });
 
         assert!(
             Value::Record(vec![

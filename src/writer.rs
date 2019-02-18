@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json;
 
 use encode::{encode, encode_inner, encode_ref_inner, encode_to_vec};
-use schema::{Schema, SchemaParseContext};
+use schema::{Schema, SchemaTree};
 use ser::Serializer;
 use types::{ToAvro, Value};
 use Codec;
@@ -35,7 +35,7 @@ impl ValidationError {
 
 /// Main interface for writing Avro formatted values.
 pub struct Writer<W> {
-    schema: Arc<Schema>,
+    schema: Schema,
     serializer: Serializer,
     writer: W,
     buffer: Vec<u8>,
@@ -62,7 +62,7 @@ impl<W: Write> Writer<W> {
         }
 
         Writer {
-            schema: Arc::new(schema.clone()),
+            schema: schema.clone(),
             serializer: Serializer::default(),
             writer,
             buffer: Vec::with_capacity(SYNC_INTERVAL),
@@ -74,7 +74,7 @@ impl<W: Write> Writer<W> {
     }
 
     /// Get a reference to the `Schema` associated to a `Writer`.
-    pub fn schema(&self) -> Arc<Schema> {
+    pub fn schema(&self) -> Schema {
         self.schema.clone()
     }
 
@@ -97,7 +97,7 @@ impl<W: Write> Writer<W> {
         };
 
         let avro = value.avro();
-        write_value_ref(&self.schema, &avro, &mut self.buffer, &mut SchemaParseContext::new())?;
+        write_value_ref(&self.schema, &avro, &mut self.buffer)?;
 
         self.num_values += 1;
 
@@ -125,7 +125,7 @@ impl<W: Write> Writer<W> {
             0
         };
 
-        write_value_ref(&self.schema, value, &mut self.buffer, &mut SchemaParseContext::new())?;
+        write_value_ref(&self.schema, value, &mut self.buffer)?;
 
         self.num_values += 1;
 
@@ -250,8 +250,8 @@ impl<W: Write> Writer<W> {
         let num_values = self.num_values;
         let stream_len = self.buffer.len();
 
-        let num_bytes = self.append_raw(&num_values.avro(), &Schema::Long)?
-            + self.append_raw(&stream_len.avro(), &Schema::Long)?
+        let num_bytes = self.append_raw(&num_values.avro(), &SchemaTree::Long)?
+            + self.append_raw(&stream_len.avro(), &SchemaTree::Long)?
             + self.writer.write(self.buffer.as_ref())?
             + self.append_marker()?;
 
@@ -277,7 +277,7 @@ impl<W: Write> Writer<W> {
     }
 
     /// Append a raw Avro Value to the payload avoiding to encode it again.
-    fn append_raw(&mut self, value: &Value, schema: &Schema) -> Result<usize, Error> {
+    fn append_raw(&mut self, value: &Value, schema: &SchemaTree) -> Result<usize, Error> {
         self.append_bytes(encode_to_vec(&value, schema).as_ref())
     }
 
@@ -288,7 +288,7 @@ impl<W: Write> Writer<W> {
 
     /// Create an Avro header based on schema, codec and sync marker.
     fn header(&self) -> Result<Vec<u8>, Error> {
-        let schema_bytes = serde_json::to_string(&*self.schema)?.into_bytes();
+        let schema_bytes = serde_json::to_string(&*self.schema.inner())?.into_bytes();
 
         let mut metadata = HashMap::with_capacity(2);
         metadata.insert("avro.schema", Value::Bytes(schema_bytes));
@@ -298,7 +298,7 @@ impl<W: Write> Writer<W> {
         header.extend_from_slice(AVRO_OBJECT_HEADER);
         encode(
             &metadata.avro(),
-            &Schema::Map(Arc::new(Schema::Bytes)),
+            &SchemaTree::Map(Arc::new(SchemaTree::Bytes)),
             &mut header,
         );
         header.extend_from_slice(&self.marker);
@@ -313,24 +313,25 @@ impl<W: Write> Writer<W> {
 /// This is an internal function which gets the bytes buffer where to write as parameter instead of
 /// creating a new one like `to_avro_datum`.
 fn write_avro_datum<T: ToAvro>(
-    schema: &Arc<Schema>,
+    schema: &Schema,
     value: T,
     buffer: &mut Vec<u8>,
-    context: &mut SchemaParseContext,
 ) -> Result<(), Error> {
+    let mut context = schema.new_context();
     let avro = value.avro();
-    if !avro.validate_inner(&schema, context) {
+    if !avro.validate_inner(&schema.inner(), &mut context) {
         return Err(ValidationError::new("value does not match schema").into())
     }
-    encode_inner(&avro, &schema, buffer, context);
+    encode_inner(&avro, &schema.inner(), buffer, &mut context);
     Ok(())
 }
 
-fn write_value_ref(schema: &Arc<Schema>, value: &Value, buffer: &mut Vec<u8>, context: &mut SchemaParseContext) -> Result<(), Error> {
-    if !value.validate_inner(&schema, context) {
+fn write_value_ref(schema: &Schema, value: &Value, buffer: &mut Vec<u8>) -> Result<(), Error> {
+    let mut context = schema.new_context();
+    if !value.validate_inner(&schema.inner(), &mut context) {
         return Err(ValidationError::new("value does not match schema").into())
     }
-    encode_ref_inner(value, &schema, buffer, context);
+    encode_ref_inner(value, &schema.inner(), buffer, &mut context);
     Ok(())
 }
 
@@ -342,7 +343,7 @@ fn write_value_ref(schema: &Arc<Schema>, value: &Value, buffer: &mut Vec<u8>, co
 /// you are doing, instead.
 pub fn to_avro_datum<T: ToAvro>(schema: &Schema, value: T) -> Result<Vec<u8>, Error> {
     let mut buffer = Vec::new();
-    write_avro_datum(&Arc::new(schema.clone()), value, &mut buffer, &mut SchemaParseContext::new())?;
+    write_avro_datum(schema, value, &mut buffer)?;
     Ok(buffer)
 }
 
